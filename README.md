@@ -5,13 +5,13 @@ An addon that enables editing of URDF files inside Blender.
 Blender 5.0 or newer
 
 ## Installation
-- Download the .zip file.
-<img width="421" height="384" alt="image" src="https://github.com/user-attachments/assets/3de51355-b0a2-451c-89f7-792f5e303718" />
+- Open a terminal and navigate to the folder where Blender addons are stored. In my case, it is located at **C:\Users\<user>\AppData\Roaming\Blender Foundation\Blender\5.x\scripts\addons\**
+- Type the following command to clone the repository
+```
+git clone https://github.com/Francois-Breedt/Blender-URDF-Editor.git
+```
 
-- In BLender, go to **Edit -> Preferences -> Add-ons**, and select **Install from Disk** in the drop down menu.
-<img width="456" height="194" alt="image" src="https://github.com/user-attachments/assets/342d6e0a-509f-4440-9686-c56c37e6fccb" />
-
-- Navigate to the downloaded .zip file, and click the button to install it from disk.
+- Now open Blender, and activate the **URDF Tools** addon in **Edit->Preferences->Add-ons**.
 
 ## Usage
 - Press N to open the side panel, and select the URDF tab
