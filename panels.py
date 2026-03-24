@@ -163,13 +163,18 @@ class URDF_PT_SimplifyPanel(bpy.types.Panel):
         layout = self.layout
         props  = context.scene.urdf
 
+        row = layout.row(align=True)
+        row.operator("urdf.select_all_visual",    text="Select Visual",    icon='RESTRICT_SELECT_OFF')
+        row.operator("urdf.select_all_collision", text="Select Collision", icon='RESTRICT_SELECT_OFF')
+        layout.operator("urdf.copy_visual_to_collision",
+                        text="Copy Visual → Collision", icon='COPYDOWN')
+        layout.separator()
         layout.label(text="Apply to selected objects:", icon='MOD_DECIM')
-        layout.prop(props, "simplify_ratio", text="Ratio", slider=True)
 
         col = layout.column(align=True)
-        col.operator("urdf.decimate_selected", icon='MOD_DECIM')
-        col.operator("urdf.convex_hull",        icon='MESH_ICOSPHERE')
-        col.operator("urdf.bounding_box",       icon='MESH_CUBE')
+        col.operator("urdf.convex_hull",             icon='MESH_ICOSPHERE')
+        col.operator("urdf.bounding_box",            icon='MESH_CUBE')
+        col.operator("urdf.oriented_bounding_box",   icon='PIVOT_BOUNDBOX')
 
         layout.separator()
         layout.operator("urdf.apply_modifiers", icon='CHECKMARK')

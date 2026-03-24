@@ -11,6 +11,7 @@ from bpy_extras.io_utils import ImportHelper, ExportHelper
 from .urdf_parser import parse_urdf
 from .blender_import import (
     build_scene, simplify_mesh, apply_convex_hull, apply_bounding_box,
+    apply_oriented_bounding_box, copy_visual_to_collision,
 )
 from .urdf_exporter import export_urdf
 
@@ -186,9 +187,9 @@ class URDF_OT_ConvexHull(bpy.types.Operator):
 
 
 class URDF_OT_BoundingBox(bpy.types.Operator):
-    """Replace selected meshes with axis-aligned bounding boxes"""
+    """Replace selected meshes with axis-aligned bounding boxes (convex hull applied after to fix triangulation)"""
     bl_idname = "urdf.bounding_box"
-    bl_label = "Bounding Box"
+    bl_label = "Bounding Box (Axis-Aligned)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -200,8 +201,30 @@ class URDF_OT_BoundingBox(bpy.types.Operator):
         for obj in context.selected_objects:
             if obj.type == 'MESH':
                 apply_bounding_box(obj)
+                apply_convex_hull(obj)
                 count += 1
         self.report({'INFO'}, f"Bounding box applied to {count} object(s)")
+        return {'FINISHED'}
+
+
+class URDF_OT_OrientedBoundingBox(bpy.types.Operator):
+    """Replace selected meshes with minimum oriented bounding boxes (PCA-fitted, convex hull applied after)"""
+    bl_idname = "urdf.oriented_bounding_box"
+    bl_label = "Bounding Box (Oriented)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(obj.type == 'MESH' for obj in context.selected_objects)
+
+    def execute(self, context):
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type == 'MESH':
+                apply_oriented_bounding_box(obj)
+                apply_convex_hull(obj)
+                count += 1
+        self.report({'INFO'}, f"Oriented bounding box applied to {count} object(s)")
         return {'FINISHED'}
 
 
@@ -296,6 +319,56 @@ class URDF_OT_ShowPolyCount(bpy.types.Operator):
             f"Visual: {vis_total:,} faces | Collision: {col_total:,} faces "
             f"| Reduction: {(1 - col_total/max(vis_total,1))*100:.1f}%",
         )
+        return {'FINISHED'}
+
+
+class URDF_OT_CopyVisualToCollision(bpy.types.Operator):
+    """Replace all collision geometry with copies of the visual geometry"""
+    bl_idname  = "urdf.copy_visual_to_collision"
+    bl_label   = "Copy Visual → Collision"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.urdf
+        copy_visual_to_collision(
+            auto_simplify=props.auto_simplify,
+            decimate_ratio=props.decimate_ratio,
+        )
+        self.report({'INFO'}, "Replaced collision geometry with visual geometry")
+        return {'FINISHED'}
+
+
+class URDF_OT_SelectAllVisual(bpy.types.Operator):
+    """Select all visual mesh objects in the scene"""
+    bl_idname  = "urdf.select_all_visual"
+    bl_label   = "Select All Visual"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        bpy.ops.object.select_all(action='DESELECT')
+        count = 0
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH' and obj.get("urdf_role") == "visual":
+                obj.select_set(True)
+                count += 1
+        self.report({'INFO'}, f"Selected {count} visual object(s)")
+        return {'FINISHED'}
+
+
+class URDF_OT_SelectAllCollision(bpy.types.Operator):
+    """Select all collision mesh objects in the scene"""
+    bl_idname  = "urdf.select_all_collision"
+    bl_label   = "Select All Collision"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        bpy.ops.object.select_all(action='DESELECT')
+        count = 0
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH' and obj.get("urdf_role") == "collision":
+                obj.select_set(True)
+                count += 1
+        self.report({'INFO'}, f"Selected {count} collision object(s)")
         return {'FINISHED'}
 
 
@@ -396,10 +469,14 @@ CLASSES = [
     URDF_OT_Decimate,
     URDF_OT_ConvexHull,
     URDF_OT_BoundingBox,
+    URDF_OT_OrientedBoundingBox,
     URDF_OT_ApplyModifiers,
     URDF_OT_TagSelected,
     URDF_OT_SelectByLink,
     URDF_OT_ShowPolyCount,
+    URDF_OT_SelectAllVisual,
+    URDF_OT_SelectAllCollision,
+    URDF_OT_CopyVisualToCollision,
     URDF_OT_ToggleLimits,
     URDF_OT_ApplyLimits,
     URDF_OT_SetLimit,

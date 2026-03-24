@@ -1,21 +1,18 @@
 """
 blender_import.py  —  Builds a Blender scene from a parsed URDFRobot.
 
-Key concepts
-------------
-Each joint gets an Empty ("joint frame", named JF_<joint_name>) that:
-  - is placed at the joint origin in its parent link's frame
-  - is parented to the parent link's joint frame
-  - has a driver on location (prismatic) or rotation_euler (revolute/continuous)
-    driven by a custom property  obj["joint_value"]
+Collision geometry strategy
+---------------------------
+For each link, in order of preference:
+  1. Import explicit <collision> geometry from the URDF (mesh or primitive).
+  2. If none exists, duplicate the visual mesh.
 
-Each link mesh is parented to its incoming joint frame empty with
-matrix_parent_inverse = Identity (no extra offset).  This works because
-SolidWorks exports mesh data already in link-frame coordinates, and the
-joint frame empty IS the link frame origin.
+Primitives (box, cylinder, sphere) are created directly via bmesh and placed
+according to the collision origin — no file import needed.
 
-Mimic joints have their joint_value driven by the source joint's joint_value
-(scaled by multiplier), have no slider exposed, and are not user-editable.
+The "Copy Visual → Collision" button (operator urdf.copy_visual_to_collision)
+replaces all collision objects in the scene with fresh duplicates of the visual
+objects and re-applies the Decimate modifier.
 """
 
 import bpy
@@ -62,8 +59,6 @@ def _move_to_collection(obj, col):
 # ---------------------------------------------------------------------------
 
 def _import_stl(filepath):
-    # Import without any scale arguments — we'll read whatever scale the
-    # importer set on the object and bake it ourselves.
     if hasattr(bpy.ops.wm, "stl_import"):
         bpy.ops.wm.stl_import(filepath=filepath)
     elif hasattr(bpy.ops.import_mesh, "stl"):
@@ -82,9 +77,13 @@ def _import_mesh_file(filepath):
         elif ext == ".obj": bpy.ops.wm.obj_import(filepath=filepath)
         elif ext == ".ply": bpy.ops.import_mesh.ply(filepath=filepath)
         elif ext == ".fbx": bpy.ops.import_scene.fbx(filepath=filepath)
-        else: print(f"[URDF] Unsupported format: {ext!r}"); return []
+        else:
+            print(f"[URDF] Unsupported format: {ext!r}")
+            return []
     except Exception as e:
-        print(f"[URDF] Import FAILED: {e}"); import traceback; traceback.print_exc(); return []
+        print(f"[URDF] Import FAILED: {e}")
+        import traceback; traceback.print_exc()
+        return []
 
     new = [bpy.data.objects[n] for n in set(bpy.data.objects.keys()) - before]
     mesh_objs, to_del = [], []
@@ -96,21 +95,24 @@ def _import_mesh_file(filepath):
     return mesh_objs
 
 
-def _geo_to_objects(geo: Geometry, name_prefix: str):
+def _geo_to_objects(geo: Geometry, name_prefix: str, is_visual: bool = True):
+    """
+    Convert a Geometry descriptor to Blender mesh objects.
+    is_visual=True  → apply 1000× bake for STL (importer returns raw mm data)
+    is_visual=False → same bake needed for collision meshes that are STL files
+    Primitives are returned in scene coords; callers move them to final collection.
+    """
     if geo is None:
         return []
+
     if geo.geo_type == "mesh":
         if not geo.mesh_filename or not os.path.exists(geo.mesh_filename):
             print(f"[URDF] Mesh not found: {geo.mesh_filename!r}")
             return []
         objs = _import_mesh_file(geo.mesh_filename)
         sx, sy, sz = geo.scale
-
         for i, obj in enumerate(objs):
             obj.name = name_prefix if len(objs) == 1 else f"{name_prefix}_{i}"
-            # The STL importer already converts mm→m internally.
-            # Just bake the importer's object scale into the vertices and
-            # apply any explicit URDF scale= attribute on top.
             imp_sx, imp_sy, imp_sz = obj.scale
             final = (imp_sx * sx, imp_sy * sy, imp_sz * sz)
             scale_mat = mathutils.Matrix.Diagonal(mathutils.Vector(final)).to_4x4()
@@ -118,6 +120,8 @@ def _geo_to_objects(geo: Geometry, name_prefix: str):
             obj.data.update()
             obj.scale = (1.0, 1.0, 1.0)
         return objs
+
+    # Primitive geometries — no file import, no scale bake needed
     if geo.geo_type == "box":
         obj = _prim_box(name_prefix, geo.size)
     elif geo.geo_type == "cylinder":
@@ -126,6 +130,7 @@ def _geo_to_objects(geo: Geometry, name_prefix: str):
         obj = _prim_sphere(name_prefix, geo.sphere_radius)
     else:
         return []
+
     bpy.context.scene.collection.objects.link(obj)
     return [obj]
 
@@ -133,7 +138,13 @@ def _geo_to_objects(geo: Geometry, name_prefix: str):
 def _prim_box(name, size):
     bm = bmesh.new(); bmesh.ops.create_cube(bm, size=1.0)
     me = bpy.data.meshes.new(name); bm.to_mesh(me); bm.free()
-    obj = bpy.data.objects.new(name, me); obj.scale = tuple(size); return obj
+    obj = bpy.data.objects.new(name, me)
+    obj.scale = tuple(size)
+    # Apply scale into vertices immediately
+    scale_mat = mathutils.Matrix.Diagonal(mathutils.Vector(size)).to_4x4()
+    me.transform(scale_mat); me.update()
+    obj.scale = (1.0, 1.0, 1.0)
+    return obj
 
 def _prim_cylinder(name, radius, length):
     bm = bmesh.new()
@@ -143,7 +154,8 @@ def _prim_cylinder(name, radius, length):
     return bpy.data.objects.new(name, me)
 
 def _prim_sphere(name, radius):
-    bm = bmesh.new(); bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=radius)
+    bm = bmesh.new()
+    bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=radius)
     me = bpy.data.meshes.new(name); bm.to_mesh(me); bm.free()
     return bpy.data.objects.new(name, me)
 
@@ -181,7 +193,7 @@ def _assign_collision_material(obj):
 
 
 # ---------------------------------------------------------------------------
-# Simplification (public — also called by operators)
+# Simplification
 # ---------------------------------------------------------------------------
 
 def simplify_mesh(obj, ratio=0.1):
@@ -196,29 +208,200 @@ def simplify_mesh(obj, ratio=0.1):
 
 
 def apply_convex_hull(obj):
+    """Replace obj's mesh with its convex hull, in-place."""
     if obj.type != 'MESH':
         return
-    bm = bmesh.new(); bm.from_mesh(obj.data)
-    result   = bmesh.ops.convex_hull(bm, input=bm.verts)
-    interior = set(result.get("geom_interior", []))
-    unused   = set(result.get("geom_unused",   []))
-    to_del   = [g for g in (interior | unused) if isinstance(g, bmesh.types.BMFace)]
-    bmesh.ops.delete(bm, geom=to_del, context='FACES')
-    bm.to_mesh(obj.data); bm.free(); obj.data.update()
+    # Evaluate modifiers first so the hull is computed on the final shape
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph))
+
+    bm = bmesh.new()
+    bm.from_mesh(eval_mesh)
+    bpy.data.meshes.remove(eval_mesh)
+
+    result = bmesh.ops.convex_hull(bm, input=bm.verts)
+
+    # Delete everything NOT part of the hull exterior
+    hull_geom = set(result.get("geom", []))
+    to_del = [g for g in bm.verts if g not in hull_geom] +              [g for g in bm.edges if g not in hull_geom] +              [g for g in bm.faces if g not in hull_geom]
+    bmesh.ops.delete(bm, geom=to_del, context='VERTS')
+
+    # Write result back — remove all modifiers first so they don't conflict
+    for mod in list(obj.modifiers):
+        obj.modifiers.remove(mod)
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
 
 
 def apply_bounding_box(obj):
+    """Replace obj's mesh with an axis-aligned bounding box in local space."""
     if obj.type != 'MESH':
         return
-    bb = [obj.matrix_world @ mathutils.Vector(v) for v in obj.bound_box]
-    xs, ys, zs = [v.x for v in bb], [v.y for v in bb], [v.z for v in bb]
+    # Evaluate modifiers to get the real vertex positions
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph))
+
+    # Compute bounds in local space (so they stay correct under the parent)
+    verts = [mathutils.Vector(v.co) for v in eval_mesh.vertices]
+    bpy.data.meshes.remove(eval_mesh)
+    if not verts:
+        return
+
+    xs = [v.x for v in verts]; ys = [v.y for v in verts]; zs = [v.z for v in verts]
     mn = mathutils.Vector((min(xs), min(ys), min(zs)))
     mx = mathutils.Vector((max(xs), max(ys), max(zs)))
-    bm = bmesh.new(); bmesh.ops.create_cube(bm, size=1.0)
-    me = bpy.data.meshes.new(obj.data.name + "_bbox"); bm.to_mesh(me); bm.free()
-    obj.data = me
-    obj.matrix_world = mathutils.Matrix.Translation((mn + mx) / 2)
-    obj.scale = tuple(mx - mn)
+    center = (mn + mx) * 0.5
+    size   = mx - mn
+
+    # Build a unit cube and scale it to the bounding box size
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+    # Scale vertices directly so obj.scale stays (1,1,1)
+    scale_mat = mathutils.Matrix.Diagonal(
+        mathutils.Vector((size.x, size.y, size.z, 1.0)))
+    bmesh.ops.transform(bm, matrix=scale_mat, verts=bm.verts)
+    # Translate to center
+    bmesh.ops.translate(bm, verts=bm.verts, vec=center)
+
+    for mod in list(obj.modifiers):
+        obj.modifiers.remove(mod)
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    obj.scale = (1.0, 1.0, 1.0)
+
+
+def apply_oriented_bounding_box(obj):
+    """
+    Replace obj's mesh with a minimum oriented bounding box.
+
+    Uses PCA (SVD of the vertex point cloud) to find the rotation that
+    minimises box volume, then builds a box in that orientation.
+    Falls back to an axis-aligned box if numpy is unavailable.
+    """
+    if obj.type != 'MESH':
+        return
+
+    try:
+        import numpy as np
+    except ImportError:
+        print("[URDF] numpy not available — falling back to axis-aligned bbox")
+        apply_bounding_box(obj)
+        return
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph))
+    pts = np.array([v.co for v in eval_mesh.vertices], dtype=np.float64)
+    bpy.data.meshes.remove(eval_mesh)
+
+    if len(pts) < 4:
+        apply_bounding_box(obj)
+        return
+
+    # PCA: centre the points, compute covariance, SVD → rotation axes
+    centroid = pts.mean(axis=0)
+    pts_c    = pts - centroid
+    _, _, Vt = np.linalg.svd(pts_c, full_matrices=False)
+    # Rows of Vt are the principal axes (largest variance first)
+    R = Vt.T  # columns = principal axes, shape (3,3)
+
+    # Ensure right-handed: if det < 0, flip the last axis
+    if np.linalg.det(R) < 0:
+        R[:, 2] *= -1
+
+    # Project points onto principal axes, find min/max → OBB in local PCA space
+    proj   = pts_c @ R           # (N, 3)
+    mn     = proj.min(axis=0)    # (3,)
+    mx     = proj.max(axis=0)    # (3,)
+    center_pca = (mn + mx) * 0.5
+    extents    = mx - mn          # full lengths along each axis
+
+    # Build a unit cube, scale to extents, rotate into PCA frame, translate
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+
+    # Scale
+    scale_mat = mathutils.Matrix.Diagonal(
+        mathutils.Vector((extents[0], extents[1], extents[2], 1.0)))
+    bmesh.ops.transform(bm, matrix=scale_mat, verts=bm.verts)
+
+    # Rotate into PCA frame
+    rot_mat = mathutils.Matrix((
+        (R[0,0], R[0,1], R[0,2], 0),
+        (R[1,0], R[1,1], R[1,2], 0),
+        (R[2,0], R[2,1], R[2,2], 0),
+        (0,      0,      0,      1),
+    ))
+    bmesh.ops.transform(bm, matrix=rot_mat, verts=bm.verts)
+
+    # Translate: center_pca is in PCA frame, convert back to local frame
+    center_local = mathutils.Vector(R @ center_pca + centroid)
+    bmesh.ops.translate(bm, verts=bm.verts, vec=center_local)
+
+    for mod in list(obj.modifiers):
+        obj.modifiers.remove(mod)
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    obj.scale = (1.0, 1.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Copy visual → collision (public, called by operator)
+# ---------------------------------------------------------------------------
+
+def copy_visual_to_collision(auto_simplify=True, decimate_ratio=0.1):
+    """
+    Replace every collision object in the scene with a fresh duplicate of its
+    matching visual object.  Called by the URDF_OT_CopyVisualToCollision operator.
+    """
+    # Find the collision collection
+    col_col = None
+    for col in bpy.data.collections:
+        if col.name.endswith("_Collision"):
+            col_col = col
+            break
+    if col_col is None:
+        print("[URDF] No Collision collection found")
+        return
+
+    # Build link_name → visual object map
+    vis_by_link = {}
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH' and obj.get("urdf_role") == "visual":
+            link = obj.get("urdf_link", "")
+            if link and link not in vis_by_link:
+                vis_by_link[link] = obj
+
+    # Remove all existing collision objects
+    for obj in list(col_col.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    # Duplicate visual objects into collision collection
+    for link_name, vis_obj in vis_by_link.items():
+        dup      = vis_obj.copy()
+        dup.data = vis_obj.data.copy()
+        bpy.context.scene.collection.objects.link(dup)
+
+        dup.name = vis_obj.name.replace("_vis_", "_col_") + "_col"
+        _move_to_collection(dup, col_col)
+        _assign_collision_material(dup)
+        dup["urdf_link"] = link_name
+        dup["urdf_role"] = "collision"
+
+        # Copy parent and local transform from visual
+        dup.parent         = vis_obj.parent
+        dup.location       = vis_obj.location.copy()
+        dup.rotation_mode  = 'XYZ'
+        dup.rotation_euler = vis_obj.rotation_euler.copy()
+
+        if auto_simplify:
+            simplify_mesh(dup, decimate_ratio)
+
+    col_col.hide_render = True
+    bpy.context.view_layer.update()
+    print(f"[URDF] Copied {len(vis_by_link)} visual → collision objects")
 
 
 # ---------------------------------------------------------------------------
@@ -226,12 +409,10 @@ def apply_bounding_box(obj):
 # ---------------------------------------------------------------------------
 
 def _build_parent_map(robot):
-    """child_link_name → URDFJoint"""
     return {j.child: j for j in robot.joints.values()}
 
 
 def _topo_order(robot, parent_map):
-    """Return link names in BFS order from root(s), so parents always precede children."""
     children_of = {}
     for link_name, joint in parent_map.items():
         children_of.setdefault(joint.parent, []).append(link_name)
@@ -251,10 +432,6 @@ def _topo_order(robot, parent_map):
 # ---------------------------------------------------------------------------
 
 def _add_driver(target_obj, data_path, array_index, source_obj, source_prop, multiplier=1.0):
-    """
-    Add a scripted driver on target_obj[data_path][array_index]
-    that evaluates to  source_obj[source_prop] * multiplier.
-    """
     fcurve = target_obj.driver_add(data_path, array_index)
     drv = fcurve.driver
     drv.type = 'SCRIPTED'
@@ -272,47 +449,24 @@ def _add_driver(target_obj, data_path, array_index, source_obj, source_prop, mul
 # Joint frame builder
 # ---------------------------------------------------------------------------
 
+BONE_LENGTH = 0.3
+
+
 def _make_joint_frame(joint, parent_frame, frame_col, mimic_source_frame=None):
-    """
-    Create an Empty for one joint.
-
-    Parenting strategy
-    ------------------
-    The empty is placed at the joint origin RELATIVE TO ITS PARENT FRAME,
-    not in world space, by setting location/rotation directly from joint.origin.
-    This is the only correct approach — world-space placement + matrix_parent_inverse
-    fights against the driver-modified transform of the parent frame.
-
-    The empty's local transform = joint.origin (translation + rotation).
-    The driver then adds a DELTA on top of that local transform:
-      - prismatic:  adds to location along the joint axis
-      - revolute/continuous: adds to rotation_euler along the joint axis
-
-    Mimic joints
-    ------------
-    A mimic joint has no user-facing slider.  Its joint_value is driven by
-    the source joint's joint_value * multiplier instead.
-    """
     name = f"JF_{joint.name}"
     obj  = bpy.data.objects.new(name, None)
     obj.empty_display_type = 'ARROWS'
     obj.empty_display_size = 0.15
     frame_col.objects.link(obj)
 
-    # ---- Place in parent-relative space ----
-    # Set rotation mode before assigning rotation
     obj.rotation_mode = 'XYZ'
-
     if parent_frame is not None:
         obj.parent = parent_frame
 
-    # Local location = joint origin translation
     obj.location = mathutils.Vector(joint.origin.xyz)
-    # Local rotation = joint origin rotation (RPY → euler XYZ)
     r, p, y = joint.origin.rpy
     obj.rotation_euler = mathutils.Euler((r, p, y), 'XYZ')
 
-    # ---- Metadata ----
     obj["urdf_joint_type"] = joint.joint_type
     obj["urdf_joint_name"] = joint.name
     obj["urdf_axis"]       = list(joint.axis)
@@ -327,93 +481,86 @@ def _make_joint_frame(joint, parent_frame, frame_col, mimic_source_frame=None):
         obj["urdf_effort"]   = lim.effort
         obj["urdf_velocity"] = lim.velocity
 
-    # ---- Fixed joints: nothing more to do ----
     if jt == "fixed":
         return obj
 
-    # ---- Determine joint_value range ----
-    is_mimic     = joint.mimic is not None
-    is_continuous = jt == "continuous"
-    is_prismatic  = jt == "prismatic"
-    is_revolute   = jt == "revolute"
+    is_mimic      = joint.mimic is not None
+    is_continuous  = jt == "continuous"
+    is_prismatic   = jt == "prismatic"
+    is_revolute    = jt == "revolute"
 
     if is_continuous:
-        # Continuous = unlimited rotation — use a wide but finite UI range
-        default  = 0.0
-        val_min  = -math.pi * 4
-        val_max  =  math.pi * 4
+        default = 0.0; val_min = -math.pi * 4; val_max = math.pi * 4
     elif is_revolute:
-        default  = lim.lower if lim else 0.0
-        val_min  = lim.lower if lim else -math.pi
-        val_max  = lim.upper if lim else  math.pi
+        default = lim.lower if lim else 0.0
+        val_min = lim.lower if lim else -math.pi
+        val_max = lim.upper if lim else  math.pi
     else:  # prismatic
-        default  = lim.lower if lim else 0.0
-        val_min  = lim.lower if lim else -10.0
-        val_max  = lim.upper if lim else  10.0
+        default = lim.lower if lim else 0.0
+        val_min = lim.lower if lim else -10.0
+        val_max = lim.upper if lim else  10.0
 
     obj["joint_value"] = default
-
-    # Set UI bounds on the custom property
     ui = obj.id_properties_ui("joint_value")
-    ui.update(
-        min=val_min, max=val_max,
-        soft_min=val_min, soft_max=val_max,
-        description=f"{jt} | axis {list(joint.axis)}",
-    )
+    ui.update(min=val_min, max=val_max, soft_min=val_min, soft_max=val_max,
+              description=f"{jt} | axis {list(joint.axis)}")
 
     ax, ay, az = joint.axis
     ox, oy, oz = joint.origin.xyz
     rr, rp, ry = joint.origin.rpy
 
     def _drive_axis(data_path, i, component, offset, src_obj, src_prop, multiplier):
-        """Drive data_path[i] = src_obj[src_prop] * multiplier * component + offset"""
         fcurve = obj.driver_add(data_path, i)
-        drv = fcurve.driver
-        drv.type = 'SCRIPTED'
-        var = drv.variables.new()
-        var.name = "v"
-        var.type = 'SINGLE_PROP'
+        drv = fcurve.driver; drv.type = 'SCRIPTED'
+        var = drv.variables.new(); var.name = "v"; var.type = 'SINGLE_PROP'
         tgt = var.targets[0]
-        tgt.id_type   = 'OBJECT'
-        tgt.id        = src_obj
+        tgt.id_type = 'OBJECT'; tgt.id = src_obj
         tgt.data_path = f'["{src_prop}"]'
         drv.expression = f"v * {multiplier * component} + {offset}"
 
     if is_mimic and mimic_source_frame is not None:
-        # Mimic joints: drive location/rotation DIRECTLY from the source
-        # joint_value, bypassing our own joint_value property entirely.
-        # This avoids Blender driver evaluation order issues where reading
-        # ["joint_value"] might return a stale value.
         mult = joint.mimic.multiplier
         src  = mimic_source_frame
-
         if is_prismatic:
-            for i, (component, offset) in enumerate(zip((ax, ay, az), (ox, oy, oz))):
-                if abs(component) < 1e-6:
-                    continue
-                _drive_axis("location", i, component, offset, src, "joint_value", mult)
+            for i, (comp, off) in enumerate(zip((ax, ay, az), (ox, oy, oz))):
+                if abs(comp) < 1e-6: continue
+                _drive_axis("location", i, comp, off, src, "joint_value", mult)
         else:
-            for i, (component, offset) in enumerate(zip((ax, ay, az), (rr, rp, ry))):
-                if abs(component) < 1e-6:
-                    continue
-                _drive_axis("rotation_euler", i, component, offset, src, "joint_value", mult)
-
+            for i, (comp, off) in enumerate(zip((ax, ay, az), (rr, rp, ry))):
+                if abs(comp) < 1e-6: continue
+                _drive_axis("rotation_euler", i, comp, off, src, "joint_value", mult)
         obj["urdf_is_mimic"] = 1
-
     else:
-        # Non-mimic: drive from our own joint_value property
         if is_prismatic:
-            for i, (component, offset) in enumerate(zip((ax, ay, az), (ox, oy, oz))):
-                if abs(component) < 1e-6:
-                    continue
-                _drive_axis("location", i, component, offset, obj, "joint_value", 1.0)
+            for i, (comp, off) in enumerate(zip((ax, ay, az), (ox, oy, oz))):
+                if abs(comp) < 1e-6: continue
+                _drive_axis("location", i, comp, off, obj, "joint_value", 1.0)
         else:
-            for i, (component, offset) in enumerate(zip((ax, ay, az), (rr, rp, ry))):
-                if abs(component) < 1e-6:
-                    continue
-                _drive_axis("rotation_euler", i, component, offset, obj, "joint_value", 1.0)
+            for i, (comp, off) in enumerate(zip((ax, ay, az), (rr, rp, ry))):
+                if abs(comp) < 1e-6: continue
+                _drive_axis("rotation_euler", i, comp, off, obj, "joint_value", 1.0)
 
     return obj
+
+
+# ---------------------------------------------------------------------------
+# Helper: add a single geometry object to a collection, parented to frame
+# ---------------------------------------------------------------------------
+
+def _add_geo_obj(obj, col, frame, origin: Pose, link_name, role, tags=None):
+    """Move obj into col, parent to frame, set local offset from origin."""
+    _move_to_collection(obj, col)
+    obj["urdf_link"] = link_name
+    obj["urdf_role"] = role
+    if tags:
+        for k, v in tags.items():
+            obj[k] = v
+    if frame is not None:
+        obj.parent = frame
+        obj.location = mathutils.Vector(origin.xyz)
+        r, p, y = origin.rpy
+        obj.rotation_mode  = 'XYZ'
+        obj.rotation_euler = mathutils.Euler((r, p, y), 'XYZ')
 
 
 # ---------------------------------------------------------------------------
@@ -439,9 +586,9 @@ def build_scene(robot: URDFRobot,
     """
     Import a URDFRobot into the current Blender scene.
 
-    Visual meshes  — imported at full resolution, never modified.
-    Collision meshes — always duplicated from visual, URDF <collision> ignored.
-    Returns {'joint_frames': {link_name: empty_obj}}
+    Collision strategy (per link):
+      1. Import explicit <collision> geometry from the URDF (mesh or primitive).
+      2. If none found, duplicate the visual mesh as fallback.
     """
     _clear_default_scene()
 
@@ -457,14 +604,11 @@ def build_scene(robot: URDFRobot,
     col_col    = _ensure_collection(f"{robot.name}_Collision",   master_col)
     frame_col  = _ensure_collection(f"{robot.name}_JointFrames", master_col)
 
-    joint_frames = {}   # link_name → Empty
-
-    # Map joint name → joint frame, for mimic lookup
+    joint_frames = {}
     joint_frame_by_joint_name = {}
 
     for link_name in topo:
         if link_name not in parent_map:
-            # Root link: plain empty at origin, no parent, no driver
             obj = bpy.data.objects.new(f"JF_{link_name}", None)
             obj.empty_display_type = 'ARROWS'
             obj.empty_display_size = 0.15
@@ -475,16 +619,13 @@ def build_scene(robot: URDFRobot,
             continue
 
         joint        = parent_map[link_name]
-        parent_frame = joint_frames[joint.parent]   # always exists (topo order)
+        parent_frame = joint_frames[joint.parent]
 
-        # Resolve mimic source frame if needed
         mimic_source_frame = None
         if joint.mimic:
-            src_joint_name = joint.mimic.joint
-            mimic_source_frame = joint_frame_by_joint_name.get(src_joint_name)
+            mimic_source_frame = joint_frame_by_joint_name.get(joint.mimic.joint)
             if mimic_source_frame is None:
-                print(f"[URDF] Mimic source joint {src_joint_name!r} not yet built — "
-                      f"mimic for {joint.name!r} will be skipped")
+                print(f"[URDF] Mimic source {joint.mimic.joint!r} not yet built — skipped")
 
         frame = _make_joint_frame(joint, parent_frame, frame_col, mimic_source_frame)
         joint_frames[link_name] = frame
@@ -493,55 +634,54 @@ def build_scene(robot: URDFRobot,
     # ---- Import meshes ----
     for link_name, link in robot.links.items():
         frame = joint_frames.get(link_name)
-        imported_visual = []
+
+        # ---- Visual ----
+        imported_visual = []   # list of (obj, Pose) — the visual origin pose
 
         if import_visual:
             for vi, vis in enumerate(link.visuals):
                 if vis.geometry is None:
                     continue
-                objs = _geo_to_objects(vis.geometry, f"{link_name}_vis_{vi}")
+                objs = _geo_to_objects(vis.geometry, f"{link_name}_vis_{vi}", is_visual=True)
                 if not objs:
                     continue
                 for obj in objs:
-                    _move_to_collection(obj, vis_col)
                     _assign_material(obj, vis.material_name, vis.color_rgba)
-                    obj["urdf_link"] = link_name
-                    obj["urdf_role"] = "visual"
+                    _add_geo_obj(obj, vis_col, frame, vis.origin, link_name, "visual")
+                    imported_visual.append((obj, vis.origin))
 
-                    if frame is not None:
-                        # Parent directly to joint frame.
-                        # mesh data is in link-frame coords, joint frame IS the
-                        # link origin → zero local offset needed.
-                        # Apply visual origin offset if non-zero (rare in SW).
-                        obj.parent = frame
-                        obj.location = mathutils.Vector(vis.origin.xyz)
-                        r, p, y = vis.origin.rpy
-                        obj.rotation_mode = 'XYZ'
-                        obj.rotation_euler = mathutils.Euler((r, p, y), 'XYZ')
-                        obj.matrix_basis = obj.matrix_basis  # keep what we set
-
-                    imported_visual.append(obj)
-
+        # ---- Collision ----
         if import_collision:
-            for src_obj in imported_visual:
-                dup      = src_obj.copy()
-                dup.data = src_obj.data.copy()
-                bpy.context.scene.collection.objects.link(dup)
+            imported_collision = []
 
-                dup.name = src_obj.name.replace("_vis_", "_col_") + "_col"
-                _move_to_collection(dup, col_col)
-                _assign_collision_material(dup)
-                dup["urdf_link"] = link_name
-                dup["urdf_role"] = "collision"
+            # Try explicit <collision> entries first
+            for ci, col_entry in enumerate(link.collisions):
+                if col_entry.geometry is None:
+                    continue
+                objs = _geo_to_objects(col_entry.geometry,
+                                       f"{link_name}_col_{ci}", is_visual=False)
+                if not objs:
+                    continue
+                for obj in objs:
+                    _assign_collision_material(obj)
+                    _add_geo_obj(obj, col_col, frame, col_entry.origin,
+                                 link_name, "collision")
+                    if auto_simplify and col_entry.geometry.geo_type == "mesh":
+                        simplify_mesh(obj, decimate_ratio)
+                    imported_collision.append(obj)
 
-                if frame is not None:
-                    dup.parent         = frame
-                    dup.location       = src_obj.location.copy()
-                    dup.rotation_mode  = 'XYZ'
-                    dup.rotation_euler = src_obj.rotation_euler.copy()
-
-                if auto_simplify:
-                    simplify_mesh(dup, decimate_ratio)
+            # Fallback: duplicate visual if no collision geometry found
+            if not imported_collision:
+                for src_obj, vis_origin in imported_visual:
+                    dup      = src_obj.copy()
+                    dup.data = src_obj.data.copy()
+                    bpy.context.scene.collection.objects.link(dup)
+                    dup.name = src_obj.name.replace("_vis_", "_col_") + "_col"
+                    _assign_collision_material(dup)
+                    _add_geo_obj(dup, col_col, frame, vis_origin,
+                                 link_name, "collision")
+                    if auto_simplify:
+                        simplify_mesh(dup, decimate_ratio)
 
     col_col.hide_render = True
     bpy.context.view_layer.update()
